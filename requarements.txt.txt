@@ -1,3 +1,4 @@
+streamlit
 pandas
 numpy
 matplotlib
@@ -8,3 +9,4 @@ tensorflow
 imbalanced-learn
 pyomo
 joblib
+pydantic
