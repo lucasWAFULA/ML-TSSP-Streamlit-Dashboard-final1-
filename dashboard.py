@@ -35,7 +35,7 @@ import joblib
 import numpy as np
 
 MODEL_VERSION = "xgb_v4"
-xgb_model = joblib.load("models/xgb_behavior.pkl")
+xgb_model = joblib.load("saved_models/xgb_behavior.pkl")
 
 BEHAVIOR_CLASSES = [
     "cooperative",
@@ -88,6 +88,8 @@ import numpy as np
 
 MODEL_VERSION = "gru_v2"
 gru_model = tf.keras.models.load_model("models/gru_reliability_deception")
+gru_reliability = load_model("saved_models/gru_reliability.h5")
+gru_deception = load_model("saved_models/gru_deception.h5")
 
 def predict_gru_scores(series):
     ts = np.array(series).reshape(1, -1, 1)
@@ -377,7 +379,7 @@ def generate_audit_log(payload, results, shap_values):
 
     return log
 
-#expose end point
+#expose endpoint
 @app.post("/export_audit")
 def export_audit(payload: dict):
     log = generate_audit_log(
@@ -397,7 +399,7 @@ import matplotlib.pyplot as plt
 from api import explain_source
 
 st.set_page_config(
-    page_title="ML–TSSP HUMINT Tasking Dashboard",
+    page_title=" ML–TSSP HUMINT Tasking Dashboard",
     layout="wide"
 )
 
@@ -495,7 +497,7 @@ if results is not None:
 
         st.table(results["policies"]["ml_tssp"])
 
-        st.metric(
+        st. metric(
             "Expected Operational Risk (EMV)",
             f"{results['emv']['ml_tssp']:.2f}"
         )
@@ -612,7 +614,7 @@ with tab5:
 
     st.table(evpi_df)
 
-    st.caption(
+    st. caption(
         "Higher EVPI indicates greater operational value "
         "from resolving uncertainty about that source."
     )
@@ -636,7 +638,7 @@ with tab6:
         color="Policy"
     )
 
-    st.caption(
+    st. caption(
         "Preferred policies achieve higher coverage with lower expected risk."
     )
 #GRU drift timeline
@@ -661,7 +663,7 @@ with tab7:
         st.line_chart(
             df.set_index("timestamp")[["reliability", "deception"]]
         )
-st.markdown(
+st. markdown(
     "<hr style='margin-top:2rem;'>"
     "<p style='text-align:center; font-size:0.85em; color:gray;'>"
     "© 2026 ML–TSSP Research Prototype. All rights reserved."
