@@ -1,4 +1,9 @@
 streamlit
+fastapi
+uvicorn
+pydantic
+joblib
+shap
 pandas
 numpy
 matplotlib
@@ -8,5 +13,4 @@ xgboost
 tensorflow
 imbalanced-learn
 pyomo
-joblib
-pydantic
+
