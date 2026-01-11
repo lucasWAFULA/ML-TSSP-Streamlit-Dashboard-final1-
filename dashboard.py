@@ -1,672 +1,351 @@
-MODE = "streamlit"  # options: "streamlit", "api", "batch"
 
-#PART A: BACKEND (FASTAPI)
-#1. API Schemas (schemas.py)
-from pydantic import BaseModel
-from typing import Dict, List
-import shap
+import streamlit as st
+import pandas as pd
+import numpy as np
 import joblib
-import numpy as np
-
-class SourceInput(BaseModel):
-    source_id: str
-    features: Dict[str, float]
-    reliability_series: List[float]
-
-class OptimizationRequest(BaseModel):
-    sources: List[SourceInput]
-    seed: int = 42
-
-class Assignment(BaseModel):
-    source_id: str
-    task: str
-    expected_risk: float
-
-class OptimizationResponse(BaseModel):
-    policies: Dict[str, List[Assignment]]
-    emv: Dict[str, float]
-    evpi: float
-    audit_log: Dict
-
-#2. ML Layer
-#i) XGBoost behavior classifier
-#ml/xgb_behavior.py
-import joblib
-import numpy as np
-
-MODEL_VERSION = "xgb_v4"
-xgb_model = joblib.load("saved_models/xgb_behavior.pkl")
-
-BEHAVIOR_CLASSES = [
-    "cooperative",
-    "uncertain",
-    "coerced",
-    "deceptive"
-]
-
-def predict_behavior_probs(features: dict):
-    x = np.array(list(features.values())).reshape(1, -1)
-    probs = xgb_model.predict_proba(x)[0]
-
-    return dict(zip(BEHAVIOR_CLASSES, probs.tolist()))
-
-#SHAP service
-#ml shap explainer.py
-xgb_model = joblib.load("models/xgb_behavior.pkl")
-
-# TreeExplainer is correct for XGBoost
-explainer = shap.TreeExplainer(xgb_model)
-
-FEATURE_NAMES = [
-    "task_success_rate",
-    "corroboration_score",
-    "report_timeliness",
-    "handler_confidence",
-    "ci_flag",
-    "scenario_probability"
-]
-
-def explain_source(features: dict):
-    x = np.array([features[f] for f in FEATURE_NAMES]).reshape(1, -1)
-
-    shap_values = explainer.shap_values(x)
-
-    # Multi-class output → return per class
-    explanation = {}
-    for i, cls in enumerate(xgb_model.classes_):
-        explanation[str(cls)] = {
-            FEATURE_NAMES[j]: float(shap_values[i][0][j])
-            for j in range(len(FEATURE_NAMES))
-        }
-
-    return explanation
-
-#3. GRU regressor (realibility + deception)
-# ml/gru_scores.py
-import tensorflow as tf
-import numpy as np
-
-MODEL_VERSION = "gru_v2"
-gru_model = tf.keras.models.load_model("models/gru_reliability_deception")
-gru_reliability = load_model("saved_models/gru_reliability.h5")
-gru_deception = load_model("saved_models/gru_deception.h5")
-
-def predict_gru_scores(series):
-    ts = np.array(series).reshape(1, -1, 1)
-    reliability, deception = gru_model.predict(ts, verbose=0)[0]
-    return float(reliability), float(deception)
-
-#4. Optimization layer (Pyomo TSSP)
-# optimization/tssp_model.py
-# optimization/tssp_model.py
+import os
+import json
+from tensorflow.keras.models import load_model
 from pyomo.environ import *
+from pyomo.opt import SolverFactory, TerminationCondition
 
-REC_COST = {
-    "cooperative": 0,
-    "uncertain": 20,
-    "coerced": 50,
-    "deceptive": 100
+# --- Configuration --- #
+MODELS_DIR = "saved_models"
+FEATURES_DIR = "saved_features"
+
+# --- Global Definitions (from notebook context) ---
+# Ensure these are consistent with what was used during training/optimization
+tasks = ['Task_A', 'Task_B', 'Task_C']
+behaviors = ["cooperative", "uncertain", "coerced", "deceptive"]
+
+recourse_cost = {
+    "cooperative": 0.0,
+    "uncertain": 20.0,
+    "coerced": 40.0,
+    "deceptive": 100.0
 }
 
-TASKS = ["Task_A", "Task_B", "Task_C"]
+total_risky_recourse_cost_sum_val = sum(recourse_cost[b] for b in ["uncertain", "coerced", "deceptive"])
 
-def solve_tssp(sources, behavior_probs, reliability, deception):
+# --- Model Loading --- #
+@st.cache_resource
+def load_ml_artifacts():
+    try:
+        xgb_classifier_reduced = joblib.load(os.path.join(MODELS_DIR, "xgb_classifier_reduced.joblib"))
+        gru_model_reliability = load_model(os.path.join(MODELS_DIR, "gru_model_reliability.keras"))
+        gru_model_deception = load_model(os.path.join(MODELS_DIR, "gru_model_deception.keras"))
+        le = joblib.load(os.path.join(MODELS_DIR, "label_encoder.joblib"))
 
-    m = ConcreteModel()
-    m.S = Set(initialize=sources)
-    m.T = Set(initialize=TASKS)
-    m.B = Set(initialize=REC_COST.keys())
+        with open(os.path.join(FEATURES_DIR, "xgb_classifier_features.json"), 'r') as f:
+            xgb_classifier_features = json.load(f)
+        with open(os.path.join(FEATURES_DIR, "regression_features.json"), 'r') as f:
+            regression_features = json.load(f)
 
-    m.x = Var(m.S, m.T, domain=Binary)
-    m.y = Var(m.S, m.T, m.B, domain=NonNegativeReals)
+        return xgb_classifier_reduced, gru_model_reliability, gru_model_deception, le, xgb_classifier_features, regression_features
+    except Exception as e:
+        st.error(f"Error loading ML artifacts: {e}")
+        return None, None, None, None, None, None
 
-    def stage1_cost(s):
-        return 10 * (1 - reliability[s]) + 15 * deception[s]
 
-    def objective(m):
-        stage1 = sum(stage1_cost(s) * m.x[s, t]
-                     for s in m.S for t in m.T)
+xgb_classifier_reduced, gru_model_reliability, gru_model_deception, le, xgb_classifier_features, regression_features = load_ml_artifacts()
 
+
+# --- ML Prediction Function --- #
+def get_ml_predictions_for_tssp(new_humint_data: pd.DataFrame):
+    if xgb_classifier_reduced is None or gru_model_reliability is None or gru_model_deception is None or le is None:
+        st.error("ML models not loaded. Cannot make predictions.")
+        return {}, {}, {}
+
+    # Ensure 'source_id' is present and set as index for easier mapping
+    if 'source_id' not in new_humint_data.columns:
+        raise ValueError("Input DataFrame must contain a 'source_id' column.")
+
+    input_sources = new_humint_data['source_id'].tolist()
+    new_humint_data_indexed = new_humint_data.set_index('source_id')
+
+    # Preprocess input data for each model
+    try:
+        X_xgb_input = new_humint_data_indexed[xgb_classifier_features]
+        X_gru_input = new_humint_data_indexed[regression_features]
+    except KeyError as e:
+        raise ValueError(f"Missing required feature in input data: {e}")
+
+    # Reshape GRU-specific DataFrame
+    X_gru_input_reshaped = X_gru_input.values.reshape(X_gru_input.shape[0], 1, X_gru_input.shape[1])
+
+    # Make predictions
+    behavior_class_probabilities_array = xgb_classifier_reduced.predict_proba(X_xgb_input)
+    reliability_predictions_array = gru_model_reliability.predict(X_gru_input_reshaped).flatten()
+    deception_predictions_array = gru_model_deception.predict(X_gru_input_reshaped).flatten()
+
+    # Format predictions
+    behavior_prob = {}
+    for i, s_id in enumerate(input_sources):
+        probs = behavior_class_probabilities_array[i]
+        behavior_prob[s_id] = {
+            le.classes_[j]: probs[j] for j in range(len(le.classes_))
+        }
+
+    reliability = {s_id: pred for s_id, pred in zip(input_sources, reliability_predictions_array)}
+    deception_risk = {s_id: pred for s_id, pred in zip(input_sources, deception_predictions_array)}
+
+    return behavior_prob, reliability, deception_risk
+
+
+# --- Pyomo Optimization Function (adapted from notebook) --- #
+def build_and_solve_tssp_model(
+    sources: list,
+    task_capacities: dict,
+    behavior_prob: dict,
+    reliability_scores: dict,
+    deception_scores: dict, # Added for task_value calculation
+    label: str = "Policy",
+):
+    model = ConcreteModel()
+
+    # --- Sets ---
+    model.S = Set(initialize=sources)
+    model.T = Set(initialize=tasks) # Use global tasks
+    model.B = Set(initialize=behaviors) # Use global behaviors
+
+    # --- Parameters ---
+    # Calculate stage1_cost based on reliability_scores
+    stage1_cost = {
+        (s, t): round(10 * (1 - reliability_scores.get(s, 0.5)), 2) # Default 0.5 if not found
+        for s in sources for t in tasks
+    }
+
+    # Calculate task_value based on predicted scores and other features from original new_humint_data
+    # This requires recreating the task_value logic for each source.
+    # For simplicity, we'll assume the input `new_humint_data` (passed to Streamlit) also contains
+    # the base features needed for task_value calculation, or that task_value is passed directly.
+    # For now, let's just make a dummy task_value. In a real scenario, this would be computed from data.
+    task_values_dict = {
+        s_id: (
+            0.30 * new_humint_data_input.loc[new_humint_data_input['source_id'] == s_id, 'task_success_rate'].iloc[0] +
+            0.20 * new_humint_data_input.loc[new_humint_data_input['source_id'] == s_id, 'corroboration_score'].iloc[0] +
+            0.20 * reliability_scores.get(s_id, 0.5) + 
+            0.15 * new_humint_data_input.loc[new_humint_data_input['source_id'] == s_id, 'report_timeliness'].iloc[0] +
+            0.10 * new_humint_data_input.loc[new_humint_data_input['source_id'] == s_id, 'handler_confidence'].iloc[0] -
+            0.05 * deception_scores.get(s_id, 0.5)
+        ).clip(0.0) # Ensure non-negative
+        for s_id in sources
+    }
+
+    model.Stage1Cost = Param(model.S, model.T, initialize=stage1_cost)
+    model.RecourseCost = Param(model.B, initialize=recourse_cost) # Use global recourse_cost
+    model.BehaviorProb = Param(model.S, model.B, initialize=lambda m, s, b: behavior_prob.get(s, {}).get(b, 0.0))
+    model.TaskCapacity = Param(model.T, initialize=task_capacities)
+    model.TotalRiskyRecourseCostSum = Param(initialize=total_risky_recourse_cost_sum_val) # Use global sum
+
+    # --- Decision variables ---
+    model.x = Var(model.S, model.T, domain=Binary)
+    model.y = Var(model.S, model.T, model.B, domain=NonNegativeReals)
+
+    # --- Constraints ---
+    def source_assignment_rule(m, s):
+        return sum(m.x[s, t] for t in m.T) == 1
+    model.SourceAssignment = Constraint(model.S, rule=source_assignment_rule)
+
+    def task_capacity_rule(m, t):
+        return sum(m.x[s, t] for s in m.S) <= m.TaskCapacity[t]
+    model.TaskCap = Constraint(model.T, rule=task_capacity_rule)
+
+    def min_task_use_rule(m, t):
+        return sum(m.x[s, t] for s in m.S) >= 1
+    model.MinTaskUse = Constraint(model.T, rule=min_task_use_rule)
+
+    def recourse_link_rule(m, s, t, b):
+        return m.y[s, t, b] <= m.x[s, t]
+    model.RecourseLink = Constraint(model.S, model.T, model.B, rule=recourse_link_rule)
+
+    def recourse_proportionality_rule(m, s, t, b):
+        if b == "cooperative":
+            return m.y[s, t, b] == 0 * m.x[s,t]
+        elif b in ["uncertain", "coerced", "deceptive"]:
+            return m.y[s, t, b] == (m.x[s, t] / m.TotalRiskyRecourseCostSum) * m.RecourseCost[b]
+        else:
+            return Constraint.Skip
+    model.RecourseProportionality = Constraint(model.S, model.T, model.B, rule=recourse_proportionality_rule)
+
+    # --- Objective ---
+    def objective_rule(m):
+        stage1 = sum(
+            m.Stage1Cost[s, t] * m.x[s, t]
+            for s in m.S for t in m.T
+        )
         stage2 = sum(
-            behavior_probs[s][b] * REC_COST[b] * m.y[s, t, b]
+            m.BehaviorProb[s, b] *
+            m.RecourseCost[b] *
+            m.y[s, t, b]
             for s in m.S for t in m.T for b in m.B
         )
+        return stage1 + stage2
 
-        reward = sum(5 * reliability[s] * m.x[s, t]
-                     for s in m.S for t in m.T)
+    model.Obj = Objective(rule=objective_rule, sense=minimize)
 
-        return stage1 + stage2 - reward
+    # --- Solve ---
+    solver = SolverFactory("glpk", executable="/usr/bin/glpsol")
+    result = solver.solve(model, tee=False)
+    model.solutions.load_from(result)
 
-    m.Obj = Objective(rule=objective, sense=minimize)
+    # Helper function to calculate total value gained
+    def _calculate_total_value_gained(solved_model, task_values_dict_inner):
+        total_value_gained = 0
+        if task_values_dict_inner is None:
+            return total_value_gained
 
-    m.Assign = Constraint(
-        m.S, rule=lambda m, s: sum(m.x[s, t] for t in m.T) == 1
-    )
+        if hasattr(solved_model, 'Obj') and solved_model.Obj.expr is not None:
+            for s_id in solved_model.S:
+                for t_id in solved_model.T:
+                    x_val = value(solved_model.x[s_id, t_id], exception=False)
+                    if x_val is not None and x_val > 0.5:
+                        total_value_gained += task_values_dict_inner.get(s_id, 0)
+                        break
+        return total_value_gained
 
-    m.Link = Constraint(
-        m.S, m.T, m.B,
-        rule=lambda m, s, t, b: m.y[s, t, b] <= m.x[s, t]
-    )
+    # --- Metrics ---
+    if result.solver.termination_condition != TerminationCondition.optimal:
+        if result.solver.termination_condition == TerminationCondition.infeasible:
+            st.warning(f"Policy {label} is infeasible. Returning large costs.")
+            return model, {
+                "Policy": label,
+                "Stage1Cost": float('inf'),
+                "Stage2Cost": float('inf'),
+                "TotalCost": float('inf'),
+                "RiskExposure": float('inf'),
+                "Total Value Gained": 0.0,
+                "Net Value": float('-inf')
+            }
+        else:
+            st.error(f"{label} did not solve optimally or infeasible. Termination condition: {result.solver.termination_condition}")
+            return model, {
+                "Policy": label,
+                "Stage1Cost": float('nan'), "Stage2Cost": float('nan'), "TotalCost": float('nan'),
+                "RiskExposure": float('nan'), "Total Value Gained": float('nan'), "Net Value": float('nan')
+            }
 
-    SolverFactory("cbc").solve(m)
+    stage1_cost_val = value(sum(
+        model.Stage1Cost[s, t] * model.x[s, t]
+        for s in model.S for t in model.T
+    ))
 
-    assignments = []
-    for s in m.S:
-        for t in m.T:
-            if m.x[s, t].value > 0.5:
-                expected_risk = sum(
-                    behavior_probs[s][b] * REC_COST[b]
-                    for b in m.B
-                )
-                assignments.append({
-                    "source_id": s,
-                    "task": t,
-                    "expected_risk": round(expected_risk, 2)
-                })
+    stage2_cost_val = value(sum(
+        model.BehaviorProb[s, b] *
+        model.RecourseCost[b] *
+        model.y[s, t, b]
+        for s in model.S for t in model.T for b in model.B
+    ))
 
-    return assignments
+    risky_mass = value(sum(
+        model.BehaviorProb[s, b]
+        for s in model.S for b in ["coerced", "deceptive"]
+    ))
 
-#Baseline solver wrapper
-#optimization/baselines.py
-#deterministic
-def solve_deterministic(sources, reliability):
-    return [
-        {
-            "source_id": s,
-            "task": "Task_A",
-            "expected_risk": 0.0
-        }
-        for s in sources
-    ]
+    total_value_gained = _calculate_total_value_gained(model, task_values_dict)
+    net_value = total_value_gained - (stage1_cost_val + stage2_cost_val)
 
-#uniform
-from optimization.tssp_model import solve_tssp
-
-def solve_uniform(sources, reliability, deception):
-    uniform_probs = {
-        s: {b: 0.25 for b in ["cooperative","uncertain","coerced","deceptive"]}
-        for s in sources
-    }
-    return solve_tssp(sources, uniform_probs, reliability, deception)
-
-#EMV + EVPI Utilities
-# optimization/emv.py
-
-def compute_emv(assignments):
-    return round(sum(a["expected_risk"] for a in assignments), 2)
-
-def compute_evpi(ml_emv, uniform_emv):
-    return round(uniform_emv - ml_emv, 2)
-
-#SOURCE-LEVEL EVPI
-from copy import deepcopy
-
-def compute_source_evpi(
-    source_id,
-    base_assignments,
-    behavior_probs,
-    recourse_cost
-):
-    base_emv = compute_emv(
-        base_assignments,
-        behavior_probs,
-        recourse_cost
-    )
-
-    # Perfect info assumption: source behavior known → zero uncertainty cost
-    perfect_probs = deepcopy(behavior_probs)
-    perfect_probs[source_id] = {
-        "cooperative": 1.0,
-        "uncertain": 0.0,
-        "coerced": 0.0,
-        "deceptive": 0.0,
+    metrics = {
+        "Policy": label,
+        "Stage1Cost": stage1_cost_val,
+        "Stage2Cost": stage2_cost_val,
+        "TotalCost": stage1_cost_val + stage2_cost_val,
+        "RiskExposure": risky_mass,
+        "Total Value Gained": total_value_gained,
+        "Net Value": net_value
     }
 
-    perfect_emv = compute_emv(
-        base_assignments,
-        perfect_probs,
-        recourse_cost
-    )
-
-    return base_emv - perfect_emv
-#Risk vs coverage scatter plot
-#optmization/metrics.py
-def compute_coverage(assignments):
-    return len(assignments)
-
-def compute_expected_risk(assignments, behavior_probs, recourse_cost):
-    risk = 0
-    for s, t in assignments:
-        for b, p in behavior_probs[s].items():
-            risk += p * recourse_cost[b]
-    return risk
-
-#return per policy
-def compute_tradeoff(ml_assignments, det_assignments, uni_assignments, behavior_probs, recourse_cost):
-    return {
-        "ml": {
-            "coverage": compute_coverage(ml_assignments),
-            "risk": compute_expected_risk(ml_assignments, behavior_probs, recourse_cost)
-        },
-        "deterministic": {
-            "coverage": compute_coverage(det_assignments),
-            "risk": compute_expected_risk(det_assignments, behavior_probs, recourse_cost)
-        },
-        "uniform": {
-            "coverage": compute_coverage(uni_assignments),
-            "risk": compute_expected_risk(uni_assignments, behavior_probs, recourse_cost)
-        }
-    }
-
-#5. FastAPI Entry point
-## main.py
-from fastapi import FastAPI
-from schemas import OptimizationRequest
-from ml.xgb_behavior import predict_behavior_probs
-from ml.gru_scores import predict_gru_scores
-from optimization.tssp_model import solve_tssp
-from optimization.baselines import solve_deterministic, solve_uniform
-from optimization.emv import compute_emv, compute_evpi
-import uuid, time
-from ml.shap_explainer import explain_source
-from schemas import SourceInput
-import hashlib
-from datetime import datetime
-
-app = FastAPI()
-
-@app.post("/optimize")
-def optimize(req: OptimizationRequest):
-
-    behavior_probs, reliability, deception = {}, {}, {}
-
-    for src in req.sources:
-        behavior_probs[src.source_id] = predict_behavior_probs(src.features)
-        r, d = predict_gru_scores(src.reliability_series)
-        reliability[src.source_id] = r
-        deception[src.source_id] = d
-
-    sources = [s.source_id for s in req.sources]
-
-    ml = solve_tssp(sources, behavior_probs, reliability, deception)
-    det = solve_deterministic(sources, reliability)
-    uni = solve_uniform(sources, reliability, deception)
-
-    ml_emv = compute_emv(ml)
-    det_emv = compute_emv(det)
-    uni_emv = compute_emv(uni)
-
-    audit_log = {
-        "run_id": str(uuid.uuid4()),
-        "timestamp": time.time(),
-        "seed": req.seed,
-        "models": {
-            "xgboost": "xgb_v4",
-            "gru": "gru_v2"
-        }
-    }
-
-    return {
-        "policies": {
-            "ml_tssp": ml,
-            "deterministic": det,
-            "uniform": uni
-        },
-        "emv": {
-            "ml_tssp": ml_emv,
-            "deterministic": det_emv,
-            "uniform": uni_emv
-        },
-        "evpi": compute_evpi(ml_emv, uni_emv),
-        "audit_log": audit_log
-    }
-
-#SHAP Service
-@app.post("/explain")
-def explain(source: SourceInput):
-    shap_values = explain_source(source.features)
-
-    return {
-        "source_id": source.source_id,
-        "shap_values": shap_values,
-        "model": "xgb_behavior_v4"
-    }
-
-#GRU drift monitoring timeline
-#logging gru outputs
-gru_log = {
-    "source_id": src.source_id,
-    "timestamp": datetime.utcnow().isoformat(),
-    "reliability": r,
-    "deception": d,
-    "model_version": "gru_v2"
-}
-#add endpoints
-@app.get("/drift/{source_id}")
-def get_drift(source_id: str):
-    records = []
-    with open("logs/gru_drift.jsonl") as f:
-        for line in f:
-            rec = json.loads(line)
-            if rec["source_id"] == source_id:
-                records.append(rec)
-    return records
-
-# Persist (file / db)
-with open("logs/gru_drift.jsonl", "a") as f:
-    f.write(json.dumps(gru_log) + "\n")
-
-#Export SHAP + decision logs to signed JSON
-
-def generate_audit_log(payload, results, shap_values):
-    log = {
-        "run_id": str(uuid.uuid4()),
-        "timestamp": datetime.utcnow().isoformat(),
-        "inputs": payload,
-        "results": results,
-        "shap": shap_values,
-        "models": {
-            "xgb": "xgb_behavior_v4",
-            "gru": "gru_v2"
-        }
-    }
-
-    hash_value = hashlib.sha256(
-        json.dumps(log, sort_keys=True).encode()
-    ).hexdigest()
-
-    log["hash"] = hash_value
-
-    return log
-
-#expose endpoint
-@app.post("/export_audit")
-def export_audit(payload: dict):
-    log = generate_audit_log(
-        payload["inputs"],
-        payload["results"],
-        payload["shap"]
-    )
-    return log
+    return model, metrics
 
 
-#B. PART B: FRONTEND (STREAMLIT)
-#frontend/app.py
-import streamlit as st
-from api import run_optimization
-import shap
-import matplotlib.pyplot as plt
-from api import explain_source
+# --- Streamlit UI --- #
+st.set_page_config(layout="wide")
+st.title("Hybrid ML-TSSP Model for HUMINT Source Management")
 
-st.set_page_config(
-    page_title=" ML–TSSP HUMINT Tasking Dashboard",
-    layout="wide"
-)
+st.markdown("""
+This dashboard integrates Machine Learning predictions with a Two-Stage Stochastic Programming (TSSP) model to optimize HUMINT source-task assignments.
 
-st.title("ML–TSSP HUMINT Source Tasking Optimisation Dashboard")
+**Upload new source data (CSV) or use the example data below.**
+""")
 
-def explain_source(source):
-    r = requests.post("http://backend:8000/explain", json=source)
-    return r.json()
+# --- Example Data --- #
+example_data_str = """
+source_id,task_success_rate,corroboration_score,report_timeliness,handler_confidence,deception_score,ci_flag,reliability_score,scenario_probability
+NEW_SRC_001,0.984967,0.903659,0.483366,0.537656,0.706109,0,0.585377,0.437983
+NEW_SRC_002,0.927617,0.595792,0.823343,0.454742,0.536490,0,0.565872,0.458523
+NEW_SRC_003,0.434477,0.923674,0.703420,0.400675,0.271757,0,0.520142,0.477865
+NEW_SRC_004,0.672230,0.636305,0.420867,0.772753,0.409994,0,0.491920,0.402423
+NEW_SRC_005,0.835658,0.930426,0.391751,0.325556,0.348083,0,0.546877,0.519225
+"""
 
+# --- Input Data --- #
+uploaded_file = st.file_uploader("Upload New HUMINT Source Data (CSV)", type=["csv"])
 
-# -------------------------------------------------
-# Session state
-# -------------------------------------------------
-if "results" not in st.session_state:
-    st.session_state.results = None
+if uploaded_file is not None:
+    new_humint_data_input = pd.read_csv(uploaded_file)
+else:
+    st.info("Using example data. Upload a CSV to use your own data.")
+    new_humint_data_input = pd.read_csv(pd.io.common.StringIO(example_data_str))
 
-# -------------------------------------------------
-# Source input panel
-# -------------------------------------------------
-st.header("Source Profiles")
+st.subheader("1. Input HUMINT Source Data")
+st.dataframe(new_humint_data_input)
 
-sources = []
+if new_humint_data_input.empty:
+    st.warning("Please provide input data to proceed.")
+else:
+    # --- ML Predictions --- #
+    st.subheader("2. ML Predictions (Behavior Probabilities, Reliability, Deception)")
+    try:
+        behavior_probs, reliability_scores, deception_risks = get_ml_predictions_for_tssp(new_humint_data_input.copy())
 
-num_sources = st.slider(
-    "Number of sources to simulate",
-    min_value=1,
-    max_value=10,
-    value=3
-)
+        st.write("**Predicted Behavior Probabilities:**")
+        st.json(behavior_probs)
 
-for i in range(num_sources):
-    st.subheader(f"Source {i + 1}")
+        st.write("**Predicted Reliability Scores:**")
+        st.json(reliability_scores)
 
-    col1, col2 = st.columns(2)
+        st.write("**Predicted Deception Risks:**")
+        st.json(deception_risks)
 
-    with col1:
-        features = {
-            "task_success_rate": st.slider(
-                "Task Success Rate",
-                0.0, 1.0, 0.6,
-                key=f"tsr_{i}"
-            ),
-            "corroboration_score": st.slider(
-                "Corroboration Score",
-                0.0, 1.0, 0.5,
-                key=f"cor_{i}"
-            ),
-            "report_timeliness": st.slider(
-                "Report Timeliness",
-                0.0, 1.0, 0.5,
-                key=f"time_{i}"
+    except Exception as e:
+        st.error(f"ML Prediction Error: {e}")
+        behavior_probs, reliability_scores, deception_risks = {}, {}, {}
+
+    if behavior_probs and reliability_scores and deception_risks:
+        # --- TSSP Optimization --- #
+        st.subheader("3. TSSP Optimization Results")
+
+        # Collect current task capacities (can be made dynamic in Streamlit if needed)
+        current_task_capacities = {"Task_A": 35, "Task_B": 35, "Task_C": 35}
+
+        try:
+            model_tssp, metrics_tssp = build_and_solve_tssp_model(
+                sources=new_humint_data_input['source_id'].tolist(),
+                task_capacities=current_task_capacities,
+                behavior_prob=behavior_probs,
+                reliability_scores=reliability_scores,
+                deception_scores=deception_risks,
+                label="ML-TSSP Live"
             )
-        }
 
-    with col2:
-        st.caption("GRU-predicted reliability trajectory")
-        reliability_ts = [0.6, 0.65, 0.7, 0.68]
-        st.line_chart(reliability_ts)
+            st.write("**Optimal Task Assignments:**")
+            assignments = []
+            if model_tssp.Obj.expr is not None and model_tssp.Obj() != float('inf'):
+                for s_id in model_tssp.S:
+                    for t_id in model_tssp.T:
+                        if value(model_tssp.x[s_id, t_id]) > 0.5:
+                            assignments.append({"Source ID": s_id, "Assigned Task": t_id})
+                            break
+                st.dataframe(pd.DataFrame(assignments))
 
-    sources.append({
-        "source_id": f"SRC_{i + 1:03d}",
-        "features": features,
-        "reliability_series": reliability_ts
-    })
+                st.write("**Performance Metrics:**")
+                metrics_df = pd.DataFrame([metrics_tssp])
+                st.dataframe(metrics_df)
 
-# -------------------------------------------------
-# Run optimisation
-# -------------------------------------------------
-st.divider()
+            else:
+                st.warning("TSSP Model did not solve optimally or was infeasible.")
+                st.json(metrics_tssp) # Show raw metrics for debugging
 
-if st.button("Run Optimisation"):
-    payload = {
-        "sources": sources,
-        "seed": 42
-    }
+        except Exception as e:
+            st.error(f"TSSP Optimization Error: {e}")
 
-    with st.spinner("Running ML–TSSP optimisation…"):
-        st.session_state.results = run_optimization(payload)
-
-    st.success("Optimisation completed")
-
-results = st.session_state.results
-
-# -------------------------------------------------
-# Results section
-# -------------------------------------------------
-if results is not None:
-    tab1, tab2, tab3, tab4, tab5, tab6,tab7 = st.tabs(
-    ["ML–TSSP", "Deterministic", "Uniform", "SHAP Explanations", "EVPI Ranking", "Risk vs Coverage","Reliability & Deception Drift"]
-)
-
-    # ---------------- ML–TSSP ----------------
-    with tab1:
-        st.subheader("Optimised ML–TSSP Policy")
-
-        st.table(results["policies"]["ml_tssp"])
-
-        st. metric(
-            "Expected Operational Risk (EMV)",
-            f"{results['emv']['ml_tssp']:.2f}"
-        )
-
-    # ---------------- Deterministic ----------------
-    with tab2:
-        st.subheader("Deterministic Assignment")
-        st.caption("Ignores uncertainty and recourse")
-
-        st.table(results["policies"]["deterministic"])
-
-        st.metric(
-            "Expected Operational Risk (EMV)",
-            f"{results['emv']['deterministic']:.2f}"
-        )
-
-    # ---------------- Uniform ----------------
-    with tab3:
-        st.subheader("Uniform-Probability TSSP")
-        st.caption("Assumes equal likelihood of behavioural outcomes")
-
-        st.table(results["policies"]["uniform"])
-
-        st.metric(
-            "Expected Operational Risk (EMV)",
-            f"{results['emv']['uniform']:.2f}"
-        )
-
-    # -------------------------------------------------
-    # EVPI panel
-    # -------------------------------------------------
-    st.divider()
-    st.header("Value of Information")
-
-    evpi = results["emv"]["uniform"] - results["emv"]["ml_tssp"]
-
-    st.metric(
-        "EVPI (Operational Value of ML)",
-        f"{evpi:.2f}"
-    )
-
-    st.caption(
-        "EVPI is computed relative to a uniform-uncertainty baseline. "
-        "Higher values indicate greater benefit from ML-driven uncertainty modelling."
-    )
-
-    # -------------------------------------------------
-    # Audit & transparency
-    # -------------------------------------------------
-    with st.expander("Audit Metadata"):
-        st.json(results.get("audit_log", {}))
-
-
-#SHAP tab UI
-with tab4:
-    st.subheader("Source-level ML Explanations (SHAP)")
-
-    selected_source = st.selectbox(
-        "Select Source",
-        [s["source_id"] for s in sources]
-    )
-
-    source_data = next(
-        s for s in sources if s["source_id"] == selected_source
-    )
-
-    if st.button("Explain Decision"):
-        explanation = explain_source(source_data)
-
-        st.caption(
-            f"SHAP explanation for XGBoost behavior classifier "
-            f"(Model: {explanation['model']})"
-        )
-
-        behavior = st.selectbox(
-            "Select Behavior Class",
-            explanation["shap_values"].keys()
-        )
-
-        shap_dict = explanation["shap_values"][behavior]
-
-        fig, ax = plt.subplots()
-        ax.barh(
-            list(shap_dict.keys()),
-            list(shap_dict.values())
-        )
-        ax.set_title(
-            f"Feature impact for behavior: {behavior}"
-        )
-        ax.set_xlabel("SHAP value")
-
-        st.pyplot(fig)
-
-        st.info(
-            "Positive values push the prediction toward this behavior. "
-            "Negative values reduce likelihood."
-        )
-
-#source evpi ranking
-tab5 = st.tabs(
-    ["EVPI Ranking"]
-)[0]
-
-with tab5:
-    st.subheader("Source-Level EVPI Ranking")
-
-    evpi_df = (
-        pd.DataFrame(
-            results["source_evpi"].items(),
-            columns=["Source", "EVPI"]
-        )
-        .sort_values("EVPI", ascending=False)
-    )
-
-    st.table(evpi_df)
-
-    st. caption(
-        "Higher EVPI indicates greater operational value "
-        "from resolving uncertainty about that source."
-    )
-#Scatter plot
-tab6 = st.tabs(["Risk vs Coverage"])[0]
-
-with tab6:
-    st.subheader("Task Coverage vs Expected Risk")
-
-    trade = results["tradeoff"]
-
-    df = pd.DataFrame([
-        {"Policy": k, "Coverage": v["coverage"], "Risk": v["risk"]}
-        for k, v in trade.items()
-    ])
-
-    st.scatter_chart(
-        df,
-        x="Risk",
-        y="Coverage",
-        color="Policy"
-    )
-
-    st. caption(
-        "Preferred policies achieve higher coverage with lower expected risk."
-    )
-#GRU drift timeline
-tab7 = st.tabs(["GRU Drift"])[0]
-
-with tab7:
-    st.subheader("Reliability & Deception Drift")
-
-    src = st.selectbox(
-        "Select Source",
-        [s["source_id"] for s in sources]
-    )
-
-    drift = requests.get(
-        f"http://backend:8000/drift/{src}"
-    ).json()
-
-    if drift:
-        df = pd.DataFrame(drift)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-        st.line_chart(
-            df.set_index("timestamp")[["reliability", "deception"]]
-        )
-st. markdown(
-    "<hr style='margin-top:2rem;'>"
-    "<p style='text-align:center; font-size:0.85em; color:gray;'>"
-    "© 2026 ML–TSSP Research Prototype. All rights reserved."
-    "</p>",
-    unsafe_allow_html=True
-)
